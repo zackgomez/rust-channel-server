@@ -6,30 +6,55 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-fn start_redis_server() -> redis::RedisResult<()> {
+fn start_redis_server(
+    channel: mpsc::Receiver<RedisCommand>,
+) -> redis::RedisResult<thread::JoinHandle<()>> {
     let client = redis::Client::open("redis://127.0.0.1/")?;
     let mut con = client.get_connection()?;
 
-    println!("connected? {:?}", con.is_open());
+    println!("connected to redis");
 
-    redis::cmd("SET").arg("my_key").arg(42).query(&con)?;
-    let val: String = redis::cmd("GET").arg("my_key").query(&con)?;
-    println!("result: {:?}", val);
+    Ok(thread::spawn(move || {
+        let mut pubsub = con.as_pubsub();
+        pubsub
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        loop {
+            let iter = channel.try_iter();
+            iter.for_each(|command| {
+                println!("got command {:?}", command);
+                match command {
+                    RedisCommand::SubscribeTopic(topic) => {
+                        println!("Subscribing to topic in redis: {:?}", topic);
+                        pubsub.subscribe(topic).unwrap();
+                    }
+                    RedisCommand::UnsubscribeTopic(topic) => {
+                        println!("Unsubscribing to topic in redis: {:?}", topic);
+                        pubsub.unsubscribe(topic).unwrap();
+                    }
+                }
+            });
 
-    let mut pubsub = con.as_pubsub();
-    pubsub.subscribe("channel_1")?;
-    loop {
-        let msg = pubsub.get_message()?;
-        let payload: String = msg.get_payload()?;
-        println!("channel '{}': {}", msg.get_channel_name(), payload);
-    }
+            if let Ok(msg) = pubsub.get_message() {
+                let payload: String = match msg.get_payload() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                println!("channel '{}': {}", msg.get_channel_name(), payload);
+            }
+        }
+    }))
 }
 
 struct WsConnection {
     sender: ws::Sender,
     topic_to_senders: Rc<RefCell<HashMap<String, Vec<ws::Sender>>>>,
     subscribed_topics: HashSet<String>,
+    redis_sender: mpsc::Sender<RedisCommand>,
 }
 
 impl WsConnection {
@@ -61,8 +86,7 @@ impl WsConnection {
             let list = map.entry(String::from(topic)).or_insert(Vec::new());
             list.push(self.sender.clone());
             if list.len() == 1 {
-                println!("subscribe to ws topic {:?}", topic);
-                // TODO subscribe to ws
+                self.send_redis_command(RedisCommand::SubscribeTopic(String::from(topic)));
             }
         }
     }
@@ -78,9 +102,15 @@ impl WsConnection {
                     senders.remove(pos);
                 }
                 if senders.is_empty() {
-                    println!("unsubscribe to ws topic {:?}", topic);
+                    self.send_redis_command(RedisCommand::UnsubscribeTopic(String::from(topic)));
                 }
             }
+        }
+    }
+
+    fn send_redis_command(&self, cmd: RedisCommand) {
+        if let Err(err) = self.redis_sender.send(cmd) {
+            println!("redis sender error {:?}", err);
         }
     }
 }
@@ -112,27 +142,32 @@ impl ws::Handler for WsConnection {
     }
 }
 
-fn start_web_socket_server() -> () {
+fn start_web_socket_server(redis_sender: mpsc::Sender<RedisCommand>) -> () {
     let topic_to_senders = Rc::new(RefCell::new(HashMap::new()));
     ws::listen("localhost:3002", |out| WsConnection {
         sender: out,
         topic_to_senders: topic_to_senders.clone(),
         subscribed_topics: HashSet::new(),
+        redis_sender: redis_sender.clone(),
     })
     .unwrap();
+}
+
+#[derive(Debug)]
+enum RedisCommand {
+    SubscribeTopic(String),
+    UnsubscribeTopic(String),
 }
 
 fn main() {
     println!("Starting");
 
-    start_web_socket_server();
+    let (redis_sender, redis_receiver): (mpsc::Sender<RedisCommand>, mpsc::Receiver<RedisCommand>) =
+        mpsc::channel();
 
-    /*
-    match start_redis_server(){
-        Ok(_) => (),
-        Err(error) => {
-            panic!("Error: {:?}", error);
-        }
-    }
-    */
+    let redis_thread = start_redis_server(redis_receiver).unwrap();
+
+    start_web_socket_server(redis_sender);
+
+    redis_thread.join().unwrap();
 }
