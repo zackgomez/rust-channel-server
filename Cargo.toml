@@ -1,0 +1,10 @@
+[package]
+name = "channel-server-rust"
+version = "0.1.0"
+authors = ["Zack Gomez <zack.gomez@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+ws = "*"
+redis = "*"
+serde_json = "1.0"
