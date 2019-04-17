@@ -27,17 +27,14 @@ fn start_redis_server(
             .unwrap();
         loop {
             let iter = channel.try_iter();
-            iter.for_each(|command| {
-                println!("got command {:?}", command);
-                match command {
-                    RedisCommand::SubscribeTopic(topic) => {
-                        println!("Subscribing to topic in redis: {:?}", topic);
-                        pubsub.subscribe(topic).unwrap();
-                    }
-                    RedisCommand::UnsubscribeTopic(topic) => {
-                        println!("Unsubscribing to topic in redis: {:?}", topic);
-                        pubsub.unsubscribe(topic).unwrap();
-                    }
+            iter.for_each(|command| match command {
+                RedisCommand::SubscribeTopic(topic) => {
+                    println!("Subscribing to topic in redis: {:?}", topic);
+                    pubsub.subscribe(topic).unwrap();
+                }
+                RedisCommand::UnsubscribeTopic(topic) => {
+                    println!("Unsubscribing to topic in redis: {:?}", topic);
+                    pubsub.unsubscribe(topic).unwrap();
                 }
             });
 
@@ -46,7 +43,6 @@ fn start_redis_server(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                println!("channel '{}': {}", msg.get_channel_name(), payload);
 
                 let map = topic_to_senders.lock().unwrap();
                 if let Some(list) = map.get(msg.get_channel_name()) {
