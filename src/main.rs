@@ -7,11 +7,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 fn start_redis_server(
     channel: mpsc::Receiver<RedisCommand>,
+    topic_to_senders: Arc<Mutex<HashMap<String, Vec<ws::Sender>>>>,
 ) -> redis::RedisResult<thread::JoinHandle<()>> {
     let client = redis::Client::open("redis://127.0.0.1/")?;
     let mut con = client.get_connection()?;
@@ -45,6 +47,15 @@ fn start_redis_server(
                     Err(_) => continue,
                 };
                 println!("channel '{}': {}", msg.get_channel_name(), payload);
+
+                let map = topic_to_senders.lock().unwrap();
+                if let Some(list) = map.get(msg.get_channel_name()) {
+                    list.iter().for_each(|sender| {
+                        if let Err(err) = sender.send(payload.clone()) {
+                            println!("Error sending payload: {:?}", err);
+                        }
+                    })
+                }
             }
         }
     }))
@@ -52,7 +63,7 @@ fn start_redis_server(
 
 struct WsConnection {
     sender: ws::Sender,
-    topic_to_senders: Rc<RefCell<HashMap<String, Vec<ws::Sender>>>>,
+    topic_to_senders: Arc<Mutex<HashMap<String, Vec<ws::Sender>>>>,
     subscribed_topics: HashSet<String>,
     redis_sender: mpsc::Sender<RedisCommand>,
 }
@@ -82,7 +93,7 @@ impl WsConnection {
         if self.subscribed_topics.insert(String::from(topic)) {
             println!("subscribe: {:?}", topic);
 
-            let mut map = self.topic_to_senders.borrow_mut();
+            let mut map = self.topic_to_senders.lock().unwrap();
             let list = map.entry(String::from(topic)).or_insert(Vec::new());
             list.push(self.sender.clone());
             if list.len() == 1 {
@@ -94,7 +105,7 @@ impl WsConnection {
         if self.subscribed_topics.remove(topic) {
             println!("unsubscribed: {:?}", topic);
 
-            let mut map = self.topic_to_senders.borrow_mut();
+            let mut map = self.topic_to_senders.lock().unwrap();
             let list = map.get_mut(topic);
             if let Some(senders) = list {
                 let pos = senders.iter().position(|x| x == &self.sender);
@@ -142,8 +153,10 @@ impl ws::Handler for WsConnection {
     }
 }
 
-fn start_web_socket_server(redis_sender: mpsc::Sender<RedisCommand>) -> () {
-    let topic_to_senders = Rc::new(RefCell::new(HashMap::new()));
+fn start_web_socket_server(
+    redis_sender: mpsc::Sender<RedisCommand>,
+    topic_to_senders: Arc<Mutex<HashMap<String, Vec<ws::Sender>>>>,
+) -> () {
     ws::listen("localhost:3002", |out| WsConnection {
         sender: out,
         topic_to_senders: topic_to_senders.clone(),
@@ -162,12 +175,14 @@ enum RedisCommand {
 fn main() {
     println!("Starting");
 
+    let topic_to_senders = Arc::new(Mutex::new(HashMap::new()));
+
     let (redis_sender, redis_receiver): (mpsc::Sender<RedisCommand>, mpsc::Receiver<RedisCommand>) =
         mpsc::channel();
 
-    let redis_thread = start_redis_server(redis_receiver).unwrap();
+    let redis_thread = start_redis_server(redis_receiver, topic_to_senders.clone()).unwrap();
 
-    start_web_socket_server(redis_sender);
+    start_web_socket_server(redis_sender, topic_to_senders.clone());
 
     redis_thread.join().unwrap();
 }
