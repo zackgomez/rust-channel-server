@@ -2,10 +2,10 @@ extern crate redis;
 extern crate serde_json;
 extern crate ws;
 
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 fn start_redis_server() -> redis::RedisResult<()> {
     let client = redis::Client::open("redis://127.0.0.1/")?;
@@ -26,8 +26,6 @@ fn start_redis_server() -> redis::RedisResult<()> {
     }
 }
 
-
-
 struct WsConnection {
     sender: ws::Sender,
     topic_to_senders: Rc<RefCell<HashMap<String, Vec<ws::Sender>>>>,
@@ -44,24 +42,23 @@ impl WsConnection {
             "subscribe" => {
                 let topic = v["topic"].as_str().unwrap_or("");
                 self.subscribe(topic);
-            },
+            }
             "unsubscribe" => {
                 let topic = v["topic"].as_str().unwrap_or("");
                 self.unsubscribe(topic);
-            },
-            _ => println!("unknown message type: {:?}", msg_type)
+            }
+            _ => println!("unknown message type: {:?}", msg_type),
         };
 
         Ok(())
     }
-
 
     fn subscribe(&mut self, topic: &str) {
         if self.subscribed_topics.insert(String::from(topic)) {
             println!("subscribe: {:?}", topic);
 
             let mut map = self.topic_to_senders.borrow_mut();
-            let mut list = map.entry(String::from(topic)).or_insert(Vec::new());
+            let list = map.entry(String::from(topic)).or_insert(Vec::new());
             list.push(self.sender.clone());
             if list.len() == 1 {
                 println!("subscribe to ws topic {:?}", topic);
@@ -74,15 +71,24 @@ impl WsConnection {
             println!("unsubscribed: {:?}", topic);
 
             let mut map = self.topic_to_senders.borrow_mut();
-            let mut list = map.get_mut(topic);
-            list.remove(self.sender);
+            let list = map.get_mut(topic);
+            if let Some(senders) = list {
+                let pos = senders.iter().position(|x| x == &self.sender);
+                if let Some(pos) = pos {
+                    senders.remove(pos);
+                }
+                if senders.is_empty() {
+                    println!("unsubscribe to ws topic {:?}", topic);
+                }
+            }
         }
     }
 }
 
 impl ws::Handler for WsConnection {
     fn on_open(&mut self, shake: ws::Handshake) -> ws::Result<()> {
-        println!("got connection with request {:?}", shake.request);
+        println!("new connection");
+        //println!("got connection with request {:?}", shake.request);
         // TODO parse jwt in shake.request.path and authenticate user
         Ok(())
     }
@@ -98,17 +104,22 @@ impl ws::Handler for WsConnection {
             }),
         }
     }
+
+    fn on_close(&mut self, _code: ws::CloseCode, reason: &str) {
+        println!("closing socket {:?}", reason);
+        let topics = self.subscribed_topics.clone();
+        topics.iter().for_each(|topic| self.unsubscribe(topic));
+    }
 }
 
 fn start_web_socket_server() -> () {
     let topic_to_senders = Rc::new(RefCell::new(HashMap::new()));
-    ws::listen("localhost:3002", |out| 
-        WsConnection { 
-            sender: out, 
-            topic_to_senders: topic_to_senders.clone(),
-            subscribed_topics: HashSet::new(),
-        }
-    ).unwrap();
+    ws::listen("localhost:3002", |out| WsConnection {
+        sender: out,
+        topic_to_senders: topic_to_senders.clone(),
+        subscribed_topics: HashSet::new(),
+    })
+    .unwrap();
 }
 
 fn main() {
